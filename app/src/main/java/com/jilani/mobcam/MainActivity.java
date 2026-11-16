@@ -3,6 +3,11 @@ package com.jilani.mobcam;
 import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.app.PendingIntent;
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
@@ -10,6 +15,7 @@ import android.graphics.SurfaceTexture;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.hardware.usb.UsbDevice;
+import android.hardware.usb.UsbManager;
 import android.opengl.GLSurfaceView;
 import android.os.Build;
 import android.os.Bundle;
@@ -40,7 +46,9 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 
-public class MainActivity extends Activity implements MonitorRenderer.Listener {
+public class MainActivity extends Activity implements MonitorRenderer.Listener, CanonPtpLive.Listener {
+
+    private static final String ACTION_USB_PERM = "com.jilani.mobcam.USB_PERMISSION";
 
     private static final int YELLOW = Color.rgb(255, 214, 10);
     private static final String[] GUIDE_NAMES = {"OFF", "9:16", "4:5", "1:1", "2.39"};
@@ -67,6 +75,10 @@ public class MainActivity extends Activity implements MonitorRenderer.Listener {
     private int guide = 0, fps = 0;
     private boolean uiHidden = false;
 
+    private UsbManager usbManager;
+    private CanonPtpLive ptp;
+    private boolean receiverOn = false;
+
     // ------------------------------------------------------------------ lifecycle
 
     @Override
@@ -90,8 +102,17 @@ public class MainActivity extends Activity implements MonitorRenderer.Listener {
         super.onRequestPermissionsResult(code, p, r);
         if (camera != null) {
             List<UsbDevice> list = camera.getDeviceList();
-            if (list != null && !list.isEmpty()) camera.selectDevice(list.get(0));
+            if (list != null) for (UsbDevice d : list) {
+                if (!CanonPtpLive.isCanonPtp(d)) { camera.selectDevice(d); break; }
+            }
         }
+        scanCanon();
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        scanCanon();
     }
 
     @Override
@@ -103,11 +124,28 @@ public class MainActivity extends Activity implements MonitorRenderer.Listener {
             camera = new CameraHelper();
             camera.setStateCallback(stateCallback);
         }
+        if (usbManager == null) usbManager = (UsbManager) getSystemService(Context.USB_SERVICE);
+        if (ptp == null) ptp = new CanonPtpLive(usbManager, this);
+        if (surfaceTexture != null) ptp.setTarget(surfaceTexture);
+        if (!receiverOn) {
+            IntentFilter f = new IntentFilter(ACTION_USB_PERM);
+            f.addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED);
+            f.addAction(UsbManager.ACTION_USB_DEVICE_DETACHED);
+            if (Build.VERSION.SDK_INT >= 33) registerReceiver(usbReceiver, f, Context.RECEIVER_NOT_EXPORTED);
+            else registerReceiver(usbReceiver, f);
+            receiverOn = true;
+        }
+        scanCanon();
     }
 
     @Override
     protected void onStop() {
         super.onStop();
+        if (receiverOn) {
+            try { unregisterReceiver(usbReceiver); } catch (Exception ignored) { }
+            receiverOn = false;
+        }
+        if (ptp != null) ptp.stop();
         if (camera != null) {
             camera.release();
             camera = null;
@@ -131,11 +169,82 @@ public class MainActivity extends Activity implements MonitorRenderer.Listener {
                         | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN);
     }
 
+    // ------------------------------------------------------------------ Canon USB-C (PTP live view)
+
+    private final BroadcastReceiver usbReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context c, Intent i) {
+            UsbDevice d = i.getParcelableExtra(UsbManager.EXTRA_DEVICE);
+            String a = i.getAction();
+            if (ACTION_USB_PERM.equals(a)) {
+                if (d != null && CanonPtpLive.isCanonPtp(d)) {
+                    if (i.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)) startCanon(d);
+                    else toast("لازم توافق على صلاحية الـ USB عشان الصورة تظهر");
+                }
+            } else if (UsbManager.ACTION_USB_DEVICE_ATTACHED.equals(a)) {
+                scanCanon();
+            } else if (UsbManager.ACTION_USB_DEVICE_DETACHED.equals(a)) {
+                if (ptp != null && d != null && ptp.getDevice() != null
+                        && d.getDeviceName().equals(ptp.getDevice().getDeviceName())) ptp.stop();
+            }
+        }
+    };
+
+    /** Finds a Canon camera plugged straight in by USB-C and starts live view from it. */
+    private void scanCanon() {
+        if (usbManager == null || ptp == null || ptp.isRunning()) return;
+        for (UsbDevice d : usbManager.getDeviceList().values()) {
+            if (!CanonPtpLive.isCanonPtp(d)) continue;
+            if (usbManager.hasPermission(d)) {
+                startCanon(d);
+            } else {
+                Intent pi = new Intent(ACTION_USB_PERM).setPackage(getPackageName());
+                int flags = Build.VERSION.SDK_INT >= 31 ? PendingIntent.FLAG_MUTABLE : 0;
+                usbManager.requestPermission(d, PendingIntent.getBroadcast(this, 0, pi, flags));
+            }
+            return;
+        }
+    }
+
+    private void startCanon(UsbDevice d) {
+        if (ptp == null || ptp.isRunning()) return;
+        if (surfaceTexture != null) ptp.setTarget(surfaceTexture);
+        ptp.start(d);
+    }
+
+    @Override
+    public void onPtpStarted(String name) {
+        ui.post(() -> toast("اتوصلت بالكاميرا: " + name + " (Type-C)"));
+    }
+
+    @Override
+    public void onPtpFrameSize(int w, int h) {
+        ui.post(() -> {
+            renderer.videoW = w;
+            renderer.videoH = h;
+            showMsg(false);
+            layoutOverlay();
+            updateInfo();
+        });
+    }
+
+    @Override
+    public void onPtpError(String msg) {
+        ui.post(() -> toast("مشكلة في الاتصال بالكاميرا: " + msg));
+    }
+
+    @Override
+    public void onPtpStopped() {
+        ui.post(() -> showMsg(true));
+    }
+
     // ------------------------------------------------------------------ camera
 
     private final ICameraHelper.StateCallback stateCallback = new ICameraHelper.StateCallback() {
         @Override
         public void onAttach(UsbDevice device) {
+            if (CanonPtpLive.isCanonPtp(device)) { scanCanon(); return; }
+            if (ptp != null && ptp.isRunning()) return;
             if (camera != null) camera.selectDevice(device);
         }
 
@@ -230,6 +339,7 @@ public class MainActivity extends Activity implements MonitorRenderer.Listener {
     public void onSurfaceTextureReady(SurfaceTexture st) {
         surfaceTexture = st;
         surfaceAttached = false;
+        if (ptp != null) ptp.setTarget(st);
         if (camera != null && camera.isCameraOpened()) attachSurface();
     }
 
@@ -362,7 +472,7 @@ public class MainActivity extends Activity implements MonitorRenderer.Listener {
     }
 
     private CharSequence centerText() {
-        SpannableString s = new SpannableString("MOBCAM\n\nوصّل الكابشر كارد بالموبايل\nوالكاميرا بكابل HDMI\n\nلو طلب صلاحية USB دوس OK");
+        SpannableString s = new SpannableString("MOBCAM\n\nوصّل الكاميرا بالموبايل بكابل Type-C\n(أو كابشر كارد + HDMI)\n\nلو طلب صلاحية USB دوس OK");
         s.setSpan(new RelativeSizeSpan(1.8f), 0, 6, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
         s.setSpan(new android.text.style.ForegroundColorSpan(YELLOW), 0, 6, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
         s.setSpan(new android.text.style.StyleSpan(Typeface.BOLD), 0, 6, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
@@ -498,7 +608,8 @@ public class MainActivity extends Activity implements MonitorRenderer.Listener {
     }
 
     private void updateInfo() {
-        info.setText(String.format(Locale.US, "%d×%d • %d fps", renderer.videoW, renderer.videoH, fps));
+        info.setText(String.format(Locale.US, "%d×%d • %d fps%s", renderer.videoW, renderer.videoH, fps,
+                ptp != null && ptp.isRunning() ? " • USB-C" : ""));
     }
 
     private void showMsg(boolean show) {
@@ -596,6 +707,10 @@ public class MainActivity extends Activity implements MonitorRenderer.Listener {
     }
 
     private void chooseSize() {
+        if (ptp != null && ptp.isRunning()) {
+            toast("في توصيل Type-C الجودة بتتحدد من الكاميرا نفسها");
+            return;
+        }
         if (camera == null || sizes.isEmpty()) {
             toast("وصّل الكابشر كارد الأول");
             return;
