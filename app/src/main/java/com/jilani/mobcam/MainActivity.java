@@ -46,7 +46,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 
-public class MainActivity extends Activity implements MonitorRenderer.Listener, CanonPtpLive.Listener {
+public class MainActivity extends Activity implements MonitorRenderer.Listener, CanonLive.Listener {
 
     private static final String ACTION_USB_PERM = "com.jilani.mobcam.USB_PERMISSION";
 
@@ -76,7 +76,9 @@ public class MainActivity extends Activity implements MonitorRenderer.Listener, 
     private boolean uiHidden = false;
 
     private UsbManager usbManager;
-    private CanonPtpLive ptp;
+    private CanonLive live;
+    private TextView recBtn;
+    private long recStart = 0;
     private boolean receiverOn = false;
 
     // ------------------------------------------------------------------ lifecycle
@@ -103,7 +105,7 @@ public class MainActivity extends Activity implements MonitorRenderer.Listener, 
         if (camera != null) {
             List<UsbDevice> list = camera.getDeviceList();
             if (list != null) for (UsbDevice d : list) {
-                if (!CanonPtpLive.isCanonPtp(d)) { camera.selectDevice(d); break; }
+                if (!UsbPtpTransport.isCanonPtp(d)) { camera.selectDevice(d); break; }
             }
         }
         scanCanon();
@@ -125,8 +127,8 @@ public class MainActivity extends Activity implements MonitorRenderer.Listener, 
             camera.setStateCallback(stateCallback);
         }
         if (usbManager == null) usbManager = (UsbManager) getSystemService(Context.USB_SERVICE);
-        if (ptp == null) ptp = new CanonPtpLive(usbManager, this);
-        if (surfaceTexture != null) ptp.setTarget(surfaceTexture);
+        if (live == null) live = new CanonLive(this);
+        if (surfaceTexture != null) live.setTarget(surfaceTexture);
         if (!receiverOn) {
             IntentFilter f = new IntentFilter(ACTION_USB_PERM);
             f.addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED);
@@ -145,7 +147,7 @@ public class MainActivity extends Activity implements MonitorRenderer.Listener, 
             try { unregisterReceiver(usbReceiver); } catch (Exception ignored) { }
             receiverOn = false;
         }
-        if (ptp != null) ptp.stop();
+        if (live != null) live.stop();
         if (camera != null) {
             camera.release();
             camera = null;
@@ -177,24 +179,24 @@ public class MainActivity extends Activity implements MonitorRenderer.Listener, 
             UsbDevice d = i.getParcelableExtra(UsbManager.EXTRA_DEVICE);
             String a = i.getAction();
             if (ACTION_USB_PERM.equals(a)) {
-                if (d != null && CanonPtpLive.isCanonPtp(d)) {
+                if (d != null && UsbPtpTransport.isCanonPtp(d)) {
                     if (i.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)) startCanon(d);
                     else toast("لازم توافق على صلاحية الـ USB عشان الصورة تظهر");
                 }
             } else if (UsbManager.ACTION_USB_DEVICE_ATTACHED.equals(a)) {
                 scanCanon();
             } else if (UsbManager.ACTION_USB_DEVICE_DETACHED.equals(a)) {
-                if (ptp != null && d != null && ptp.getDevice() != null
-                        && d.getDeviceName().equals(ptp.getDevice().getDeviceName())) ptp.stop();
+                if (live != null && d != null && live.source() instanceof UsbDevice
+                        && d.getDeviceName().equals(((UsbDevice) live.source()).getDeviceName())) live.stop();
             }
         }
     };
 
     /** Finds a Canon camera plugged straight in by USB-C and starts live view from it. */
     private void scanCanon() {
-        if (usbManager == null || ptp == null || ptp.isRunning()) return;
+        if (usbManager == null || live == null || live.isRunning()) return;
         for (UsbDevice d : usbManager.getDeviceList().values()) {
-            if (!CanonPtpLive.isCanonPtp(d)) continue;
+            if (!UsbPtpTransport.isCanonPtp(d)) continue;
             if (usbManager.hasPermission(d)) {
                 startCanon(d);
             } else {
@@ -207,18 +209,140 @@ public class MainActivity extends Activity implements MonitorRenderer.Listener, 
     }
 
     private void startCanon(UsbDevice d) {
-        if (ptp == null || ptp.isRunning()) return;
-        if (surfaceTexture != null) ptp.setTarget(surfaceTexture);
-        ptp.start(d);
+        if (live == null || live.isRunning()) return;
+        if (surfaceTexture != null) live.setTarget(surfaceTexture);
+        live.start("USB-C", d, () -> new UsbPtpTransport(usbManager, d));
+    }
+
+    // ------------------------------------------------------------------ Wi-Fi
+
+    private byte[] guid() {
+        String g = prefs.getString("guid", null);
+        byte[] b = new byte[16];
+        if (g != null && g.length() == 32) {
+            for (int i = 0; i < 16; i++) b[i] = (byte) Integer.parseInt(g.substring(i * 2, i * 2 + 2), 16);
+            return b;
+        }
+        new java.security.SecureRandom().nextBytes(b);
+        StringBuilder sb = new StringBuilder();
+        for (byte x : b) sb.append(String.format(Locale.US, "%02x", x & 0xff));
+        prefs.edit().putString("guid", sb.toString()).apply();
+        return b;
+    }
+
+    private void showWifi() {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(dp(20), dp(8), dp(20), dp(8));
+        TextView help = new TextView(this);
+        help.setTextColor(Color.rgb(200, 200, 200));
+        help.setTextSize(13);
+        help.setLineSpacing(0, 1.25f);
+        help.setText("في الكاميرا: Wireless settings ← Wi‑Fi function ← Remote control (EOS Utility)\n"
+                + "وصّل الموبايل على نفس الواي فاي (أو على شبكة الكاميرا نفسها)، وبعدين اكتب IP الكاميرا اللي ظاهر على شاشتها أو دوس «دوّر».\n"
+                + "أول مرة الكاميرا هتسأل عن الربط — دوس OK.");
+        box.addView(help);
+        final android.widget.EditText ip = new android.widget.EditText(this);
+        ip.setHint("192.168.1.2");
+        ip.setText(prefs.getString("ip", ""));
+        ip.setTextColor(Color.WHITE);
+        ip.setInputType(android.text.InputType.TYPE_CLASS_PHONE);
+        box.addView(ip, new LinearLayout.LayoutParams(-1, -2));
+        final TextView status = settingRow(box, "");
+        status.setTextColor(YELLOW);
+
+        final AlertDialog dlg = new AlertDialog.Builder(this, AlertDialog.THEME_DEVICE_DEFAULT_DARK)
+                .setTitle("توصيل واي فاي")
+                .setView(box)
+                .setPositiveButton("اتصل", (d, w) -> connectWifi(ip.getText().toString().trim()))
+                .setNeutralButton("دوّر", null)
+                .setNegativeButton(live != null && live.isRunning() && "Wi-Fi".equals(live.how()) ? "اقطع" : "إلغاء",
+                        (d, w) -> { if (live != null && "Wi-Fi".equals(live.how())) live.stop(); })
+                .setOnDismissListener(d -> hideSystemUi())
+                .create();
+        dlg.setOnShowListener(d -> dlg.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(v -> {
+            status.setText("بدوّر على الكاميرا…");
+            new Thread(() -> {
+                final java.util.Set<String> f = CameraFinder.find(getApplicationContext(), 3000);
+                ui.post(() -> {
+                    if (f.isEmpty()) status.setText("ملقتش حاجة — اكتب الـ IP من شاشة الكاميرا");
+                    else {
+                        ip.setText(f.iterator().next());
+                        status.setText("لقيت: " + android.text.TextUtils.join(" ، ", f));
+                    }
+                });
+            }).start();
+        }));
+        dlg.show();
+    }
+
+    private void connectWifi(final String host) {
+        if (host.isEmpty()) { toast("اكتب IP الكاميرا"); return; }
+        prefs.edit().putString("ip", host).apply();
+        if (live.isRunning()) live.stop();
+        if (surfaceTexture != null) live.setTarget(surfaceTexture);
+        if (camera != null) detachSurface();
+        final byte[] g = guid();
+        toast("بتصل بالكاميرا… لو سألت عن الربط دوس OK على الكاميرا");
+        live.start("Wi-Fi", host, () -> new IpPtpTransport(getApplicationContext(), host, g, "MOBCAM"));
+    }
+
+    // ------------------------------------------------------------------ record / focus
+
+    private boolean needLive() {
+        if (live != null && live.isRunning()) return true;
+        toast("الريكورد والفوكس شغالين مع توصيل Type-C أو الواي فاي بس");
+        return false;
+    }
+
+    private final Runnable recTick = new Runnable() {
+        @Override public void run() {
+            if (live != null && live.isRecording()) { applySettings(); ui.postDelayed(this, 1000); }
+        }
+    };
+
+    @Override
+    public void onRecordState(boolean recording, boolean ok) {
+        ui.post(() -> {
+            if (!ok) toast(recording ? "مقدرتش أوقف التسجيل" : "مقدرتش أبدأ التسجيل — حوّل الكاميرا لوضع الفيديو 🎥");
+            recStart = recording ? android.os.SystemClock.elapsedRealtime() : 0;
+            ui.removeCallbacks(recTick);
+            if (recording) ui.post(recTick);
+            applySettings();
+        });
+    }
+
+    // ------------------------------------------------------------------ rotation lock
+
+    private int currentOrientation() {
+        int rot = getWindowManager().getDefaultDisplay().getRotation();
+        boolean land = getResources().getConfiguration().orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE;
+        if (land) return (rot == android.view.Surface.ROTATION_0 || rot == android.view.Surface.ROTATION_90)
+                ? android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+                : android.content.pm.ActivityInfo.SCREEN_ORIENTATION_REVERSE_LANDSCAPE;
+        return (rot == android.view.Surface.ROTATION_0 || rot == android.view.Surface.ROTATION_270)
+                ? android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                : android.content.pm.ActivityInfo.SCREEN_ORIENTATION_REVERSE_PORTRAIT;
+    }
+
+    private void applyRotation() {
+        if (prefs.getBoolean("rotlock", false)) {
+            int o = prefs.getInt("rotO", -100);
+            if (o == -100) { o = currentOrientation(); prefs.edit().putInt("rotO", o).apply(); }
+            setRequestedOrientation(o);
+        } else {
+            prefs.edit().remove("rotO").apply();
+            setRequestedOrientation(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR);
+        }
     }
 
     @Override
-    public void onPtpStarted(String name) {
-        ui.post(() -> toast("اتوصلت بالكاميرا: " + name + " (Type-C)"));
+    public void onLiveStarted(String how) {
+        ui.post(() -> { toast("اتوصلت بالكاميرا (" + how + ")"); updateInfo(); });
     }
 
     @Override
-    public void onPtpFrameSize(int w, int h) {
+    public void onLiveFrameSize(int w, int h) {
         ui.post(() -> {
             renderer.videoW = w;
             renderer.videoH = h;
@@ -229,13 +353,19 @@ public class MainActivity extends Activity implements MonitorRenderer.Listener, 
     }
 
     @Override
-    public void onPtpError(String msg) {
+    public void onLiveError(String msg) {
         ui.post(() -> toast("مشكلة في الاتصال بالكاميرا: " + msg));
     }
 
     @Override
-    public void onPtpStopped() {
-        ui.post(() -> showMsg(true));
+    public void onLiveStopped() {
+        ui.post(() -> {
+            showMsg(true);
+            recStart = 0;
+            applySettings();
+            updateInfo();
+            scanCanon();
+        });
     }
 
     // ------------------------------------------------------------------ camera
@@ -243,8 +373,8 @@ public class MainActivity extends Activity implements MonitorRenderer.Listener, 
     private final ICameraHelper.StateCallback stateCallback = new ICameraHelper.StateCallback() {
         @Override
         public void onAttach(UsbDevice device) {
-            if (CanonPtpLive.isCanonPtp(device)) { scanCanon(); return; }
-            if (ptp != null && ptp.isRunning()) return;
+            if (UsbPtpTransport.isCanonPtp(device)) { scanCanon(); return; }
+            if (live != null && live.isRunning()) return;
             if (camera != null) camera.selectDevice(device);
         }
 
@@ -339,7 +469,7 @@ public class MainActivity extends Activity implements MonitorRenderer.Listener, 
     public void onSurfaceTextureReady(SurfaceTexture st) {
         surfaceTexture = st;
         surfaceAttached = false;
-        if (ptp != null) ptp.setTarget(st);
+        if (live != null) live.setTarget(st);
         if (camera != null && camera.isCameraOpened()) attachSurface();
     }
 
@@ -452,6 +582,10 @@ public class MainActivity extends Activity implements MonitorRenderer.Listener, 
         bar = sv;
         root.addView(sv, new FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM));
 
+        recBtn = button(row, "ريكورد", "● REC", v -> { if (needLive()) live.toggleRecord(); });
+        button(row, "فوكس", "AF", v -> { if (needLive()) live.autofocus(); });
+        button(row, "فوكس قريب", "◀ NEAR", v -> { if (needLive()) live.driveFocus(true, 2); });
+        button(row, "فوكس بعيد", "FAR ▶", v -> { if (needLive()) live.driveFocus(false, 2); });
         addToggle(row, "بيكينج", "PEAKING", "peak");
         addToggle(row, "زيبرا", "ZEBRA", "zebra");
         addToggle(row, "ألوان التعريض", "FALSE CLR", "fc");
@@ -466,13 +600,15 @@ public class MainActivity extends Activity implements MonitorRenderer.Listener, 
         addToggle(row, "ميرور", "MIRROR", "mirror");
         addToggle(row, "عرض اللوج", "LOG→709", "log");
         addToggle(row, "قلب الصورة", "FLIP 180", "flip");
+        addToggle(row, "قفل التدوير", "ROT LOCK", "rotlock");
+        button(row, "واي فاي", "Wi-Fi", v -> showWifi());
         button(row, "الإعدادات", "SETUP", v -> showSettings());
 
         setContentView(root);
     }
 
     private CharSequence centerText() {
-        SpannableString s = new SpannableString("MOBCAM\n\nوصّل الكاميرا بالموبايل بكابل Type-C\n(أو كابشر كارد + HDMI)\n\nلو طلب صلاحية USB دوس OK");
+        SpannableString s = new SpannableString("MOBCAM\n\nوصّل الكاميرا بالموبايل بكابل Type-C\nأو دوس «واي فاي» تحت\n(أو كابشر كارد + HDMI)\n\nلو طلب صلاحية USB دوس OK");
         s.setSpan(new RelativeSizeSpan(1.8f), 0, 6, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
         s.setSpan(new android.text.style.ForegroundColorSpan(YELLOW), 0, 6, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
         s.setSpan(new android.text.style.StyleSpan(Typeface.BOLD), 0, 6, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
@@ -568,7 +704,24 @@ public class MainActivity extends Activity implements MonitorRenderer.Listener, 
         overlay.invalidate();
         hist.setVisibility(renderer.histogram && !uiHidden ? View.VISIBLE : View.GONE);
 
+        applyRotation();
+        boolean rec = live != null && live.isRecording();
+        if (recBtn != null) {
+            styleBtn(recBtn, false);
+            if (rec) {
+                GradientDrawable rb = new GradientDrawable();
+                rb.setCornerRadius(dp(10));
+                rb.setColor(Color.rgb(220, 30, 30));
+                recBtn.setBackground(rb);
+                recBtn.setTextColor(Color.WHITE);
+            }
+        }
+
         StringBuilder m = new StringBuilder();
+        if (rec && recStart > 0) {
+            long sec = (android.os.SystemClock.elapsedRealtime() - recStart) / 1000;
+            m.append(String.format(Locale.US, "● REC %02d:%02d  ", sec / 60, sec % 60));
+        }
         if (renderer.zoom > 1f) m.append("ZOOM ").append((int) renderer.zoom).append("×  ");
         if (renderer.peak) m.append("PEAK  ");
         if (renderer.zebra) m.append("ZEB ").append(Math.round(renderer.zebraLevel * 100)).append("  ");
@@ -609,7 +762,7 @@ public class MainActivity extends Activity implements MonitorRenderer.Listener, 
 
     private void updateInfo() {
         info.setText(String.format(Locale.US, "%d×%d • %d fps%s", renderer.videoW, renderer.videoH, fps,
-                ptp != null && ptp.isRunning() ? " • USB-C" : ""));
+                live != null && live.isRunning() ? " • " + live.how() : ""));
     }
 
     private void showMsg(boolean show) {
@@ -707,8 +860,8 @@ public class MainActivity extends Activity implements MonitorRenderer.Listener, 
     }
 
     private void chooseSize() {
-        if (ptp != null && ptp.isRunning()) {
-            toast("في توصيل Type-C الجودة بتتحدد من الكاميرا نفسها");
+        if (live != null && live.isRunning()) {
+            toast("في توصيل Type-C والواي فاي الجودة بتتحدد من الكاميرا نفسها");
             return;
         }
         if (camera == null || sizes.isEmpty()) {
