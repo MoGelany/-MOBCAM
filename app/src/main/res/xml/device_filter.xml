@@ -5,4 +5,6 @@
     <usb-device class="14" />
     <!-- Canon EOS cameras plugged straight in by USB-C -->
     <usb-device vendor-id="1193" />
+    <!-- Sony cameras in PC Remote mode -->
+    <usb-device vendor-id="1356" />
 </resources>

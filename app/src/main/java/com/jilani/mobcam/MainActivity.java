@@ -46,7 +46,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 
-public class MainActivity extends Activity implements MonitorRenderer.Listener, CanonLive.Listener {
+public class MainActivity extends Activity implements MonitorRenderer.Listener, CameraLive.Listener {
 
     private static final String ACTION_USB_PERM = "com.jilani.mobcam.USB_PERMISSION";
 
@@ -76,7 +76,8 @@ public class MainActivity extends Activity implements MonitorRenderer.Listener, 
     private boolean uiHidden = false;
 
     private UsbManager usbManager;
-    private CanonLive live;
+    private CameraLive live;
+    private TextView modeBtn;
     private TextView recBtn;
     private long recStart = 0;
     private boolean receiverOn = false;
@@ -105,7 +106,7 @@ public class MainActivity extends Activity implements MonitorRenderer.Listener, 
         if (camera != null) {
             List<UsbDevice> list = camera.getDeviceList();
             if (list != null) for (UsbDevice d : list) {
-                if (!UsbPtpTransport.isCanonPtp(d)) { camera.selectDevice(d); break; }
+                if (!UsbPtpTransport.isPtpCamera(d)) { camera.selectDevice(d); break; }
             }
         }
         scanCanon();
@@ -127,7 +128,7 @@ public class MainActivity extends Activity implements MonitorRenderer.Listener, 
             camera.setStateCallback(stateCallback);
         }
         if (usbManager == null) usbManager = (UsbManager) getSystemService(Context.USB_SERVICE);
-        if (live == null) live = new CanonLive(this);
+        if (live == null) live = new CameraLive(this, getCacheDir());
         if (surfaceTexture != null) live.setTarget(surfaceTexture);
         if (!receiverOn) {
             IntentFilter f = new IntentFilter(ACTION_USB_PERM);
@@ -179,7 +180,7 @@ public class MainActivity extends Activity implements MonitorRenderer.Listener, 
             UsbDevice d = i.getParcelableExtra(UsbManager.EXTRA_DEVICE);
             String a = i.getAction();
             if (ACTION_USB_PERM.equals(a)) {
-                if (d != null && UsbPtpTransport.isCanonPtp(d)) {
+                if (d != null && UsbPtpTransport.isPtpCamera(d)) {
                     if (i.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)) startCanon(d);
                     else toast("لازم توافق على صلاحية الـ USB عشان الصورة تظهر");
                 }
@@ -192,11 +193,11 @@ public class MainActivity extends Activity implements MonitorRenderer.Listener, 
         }
     };
 
-    /** Finds a Canon camera plugged straight in by USB-C and starts live view from it. */
+    /** Finds a Canon / Sony camera plugged straight in by USB-C and starts live view from it. */
     private void scanCanon() {
         if (usbManager == null || live == null || live.isRunning()) return;
         for (UsbDevice d : usbManager.getDeviceList().values()) {
-            if (!UsbPtpTransport.isCanonPtp(d)) continue;
+            if (!UsbPtpTransport.isPtpCamera(d)) continue;
             if (usbManager.hasPermission(d)) {
                 startCanon(d);
             } else {
@@ -211,7 +212,7 @@ public class MainActivity extends Activity implements MonitorRenderer.Listener, 
     private void startCanon(UsbDevice d) {
         if (live == null || live.isRunning()) return;
         if (surfaceTexture != null) live.setTarget(surfaceTexture);
-        live.start("USB-C", d, () -> new UsbPtpTransport(usbManager, d));
+        live.start("USB-C", d, d.getVendorId(), () -> new UsbPtpTransport(usbManager, d));
     }
 
     // ------------------------------------------------------------------ Wi-Fi
@@ -284,14 +285,14 @@ public class MainActivity extends Activity implements MonitorRenderer.Listener, 
         if (camera != null) detachSurface();
         final byte[] g = guid();
         toast("بتصل بالكاميرا… لو سألت عن الربط دوس OK على الكاميرا");
-        live.start("Wi-Fi", host, () -> new IpPtpTransport(getApplicationContext(), host, g, "MOBCAM"));
+        live.start("Wi-Fi", host, 0, () -> new IpPtpTransport(getApplicationContext(), host, g, "MOBCAM"));
     }
 
     // ------------------------------------------------------------------ record / focus
 
     private boolean needLive() {
         if (live != null && live.isRunning()) return true;
-        toast("الريكورد والفوكس شغالين مع توصيل Type-C أو الواي فاي بس");
+        toast("التحكم والمعرض شغالين مع توصيل Type-C أو الواي فاي بس (مش الكابشر كارد)");
         return false;
     }
 
@@ -337,8 +338,32 @@ public class MainActivity extends Activity implements MonitorRenderer.Listener, 
     }
 
     @Override
-    public void onLiveStarted(String how) {
-        ui.post(() -> { toast("اتوصلت بالكاميرا (" + how + ")"); updateInfo(); });
+    public void onLiveStarted(String how, String brand) {
+        ui.post(() -> { toast("اتوصلت بالكاميرا " + brand + " (" + how + ")"); updateInfo(); applySettings(); });
+    }
+
+    @Override
+    public void onModeChanged(boolean movie, boolean ok) {
+        ui.post(() -> {
+            if (!ok) toast("الكاميرا دي مش بتسمح تغيير وضع الصور/الفيديو من التطبيق — غيّره من الكاميرا");
+            else toast(movie ? "وضع الفيديو 🎥" : "وضع الصور 📷");
+            applySettings();
+        });
+    }
+
+    @Override
+    public void onPhotoTaken(boolean ok) {
+        ui.post(() -> {
+            if (!ok) toast("مقدرتش أصوّر — لو الكاميرا في وضع الفيديو حوّلها لوضع الصور");
+            else if (overlay != null) {
+                overlay.animate().alpha(0f).setDuration(60).withEndAction(() -> overlay.animate().alpha(1f).setDuration(120).start()).start();
+            }
+        });
+    }
+
+    @Override
+    public void onPhotoReady(PtpMedia.Item it, java.io.File f, android.graphics.Bitmap b) {
+        ui.post(() -> new GalleryUi(this, live, this::hideSystemUi).showPhoto(it, f, b));
     }
 
     @Override
@@ -373,7 +398,7 @@ public class MainActivity extends Activity implements MonitorRenderer.Listener, 
     private final ICameraHelper.StateCallback stateCallback = new ICameraHelper.StateCallback() {
         @Override
         public void onAttach(UsbDevice device) {
-            if (UsbPtpTransport.isCanonPtp(device)) { scanCanon(); return; }
+            if (UsbPtpTransport.isPtpCamera(device)) { scanCanon(); return; }
             if (live != null && live.isRunning()) return;
             if (camera != null) camera.selectDevice(device);
         }
@@ -583,6 +608,9 @@ public class MainActivity extends Activity implements MonitorRenderer.Listener, 
         root.addView(sv, new FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM));
 
         recBtn = button(row, "ريكورد", "● REC", v -> { if (needLive()) live.toggleRecord(); });
+        button(row, "صورة", "◉ PHOTO", v -> { if (needLive()) live.takePhoto(prefs.getBoolean("showshot", true)); });
+        modeBtn = button(row, "صور/فيديو", "PHOTO", v -> { if (needLive()) live.setMovieMode(!live.isMovieMode()); });
+        button(row, "المعرض", "PLAYBACK", v -> { if (needLive()) new GalleryUi(this, live, this::hideSystemUi).showGallery(); });
         button(row, "فوكس", "AF", v -> { if (needLive()) live.autofocus(); });
         button(row, "فوكس قريب", "◀ NEAR", v -> { if (needLive()) live.driveFocus(true, 2); });
         button(row, "فوكس بعيد", "FAR ▶", v -> { if (needLive()) live.driveFocus(false, 2); });
@@ -717,6 +745,11 @@ public class MainActivity extends Activity implements MonitorRenderer.Listener, 
             }
         }
 
+        if (modeBtn != null) {
+            boolean mv = live != null && live.isMovieMode();
+            setLabel(modeBtn, mv ? "MOVIE 🎥" : "PHOTO 📷");
+        }
+
         StringBuilder m = new StringBuilder();
         if (rec && recStart > 0) {
             long sec = (android.os.SystemClock.elapsedRealtime() - recStart) / 1000;
@@ -762,7 +795,7 @@ public class MainActivity extends Activity implements MonitorRenderer.Listener, 
 
     private void updateInfo() {
         info.setText(String.format(Locale.US, "%d×%d • %d fps%s", renderer.videoW, renderer.videoH, fps,
-                live != null && live.isRunning() ? " • " + live.how() : ""));
+                live != null && live.isRunning() ? " • " + live.brand() + " " + live.how() : ""));
     }
 
     private void showMsg(boolean show) {
@@ -785,6 +818,13 @@ public class MainActivity extends Activity implements MonitorRenderer.Listener, 
         TextView res = settingRow(box, "الجودة: " + (cur != null ? describe(cur) : "—"));
         res.setTextColor(YELLOW);
         res.setOnClickListener(v -> chooseSize());
+
+        final android.widget.CheckBox showShot = new android.widget.CheckBox(this);
+        showShot.setText("اعرض الصورة على الموبايل بعد ما أصوّر");
+        showShot.setTextColor(Color.rgb(220, 220, 220));
+        showShot.setChecked(prefs.getBoolean("showshot", true));
+        showShot.setOnCheckedChangeListener((cb, on) -> prefs.edit().putBoolean("showshot", on).apply());
+        box.addView(showShot);
 
         // peaking colour
         settingRow(box, "لون البيكينج");

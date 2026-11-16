@@ -23,9 +23,11 @@ public class UsbPtpTransport implements PtpTransport {
     private int tid = 1;
     private final byte[] rx = new byte[Build.VERSION.SDK_INT >= 28 ? 512 * 1024 : 16384];
 
-    /** A Canon camera exposing a still-image (PTP) interface and no UVC video interface. */
-    public static boolean isCanonPtp(UsbDevice d) {
-        if (d == null || d.getVendorId() != CANON_VID) return false;
+    public static final int SONY_VID = 0x054C;
+
+    /** A Canon / Sony camera exposing a still-image (PTP) interface and no UVC video interface. */
+    public static boolean isPtpCamera(UsbDevice d) {
+        if (d == null || (d.getVendorId() != CANON_VID && d.getVendorId() != SONY_VID)) return false;
         boolean ptp = false;
         for (int i = 0; i < d.getInterfaceCount(); i++) {
             int c = d.getInterface(i).getInterfaceClass();
